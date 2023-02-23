@@ -1,3 +1,4 @@
+#docker run -it --gpus all -v C:/Users/dong/anaconda3/Thesis:/Thesis -w /Thesis 46961
 from transformers import BertTokenizer
 
 #加载预训练字典和分词方法
@@ -296,7 +297,7 @@ dataset.to_csv(path_or_buf='./data/ChnSentiCorp.csv')
 csv_dataset = load_dataset(path='csv',
                            data_files='./data/ChnSentiCorp.csv',
                            split='train')
-csv_dataset[20]
+print(csv_dataset[20])
 
 #第三章/导出为json格式
 dataset = load_dataset(path='seamew/ChnSentiCorp', split='train')
@@ -306,4 +307,4 @@ dataset.to_json(path_or_buf='./data/ChnSentiCorp.json')
 json_dataset = load_dataset(path='json',
                             data_files='./data/ChnSentiCorp.json',
                             split='train')
-json_dataset[20]
+print(json_dataset[20])
