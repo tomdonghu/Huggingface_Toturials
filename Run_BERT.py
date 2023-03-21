@@ -1,310 +1,172 @@
-#docker run -it --gpus all -v C:/Users/dong/anaconda3/Thesis:/Thesis -w /Thesis 46961
-from transformers import BertTokenizer
-
-#加载预训练字典和分词方法
-tokenizer = BertTokenizer.from_pretrained(
-    pretrained_model_name_or_path='bert-base-chinese',
-    cache_dir=None,
-    force_download=False,
+import torch
+import numpy as np
+import pandas as pd
+import transformers
+from sklearn.model_selection import train_test_split
+from transformers import AutoModel, BertTokenizerFast
+from tqdm import tqdm
+from transformers import (
+  BertTokenizerFast,
+  AutoModel,
 )
+from torch.utils.data import TensorDataset, RandomSampler, DataLoader
+from torch import nn
+from transformers import AdamW
+import torch.nn.functional as F
+from sklearn.utils.class_weight import compute_class_weight
+from tqdm import tqdm
 
-####################ckip
 
-# from transformers import (
-#   BertTokenizerFast,
-#   AutoModel,
-# )
+
+
+CVAP_all_SD_df = pd.read_csv('./ChineseEmoBank/CVAP_SD/CVAP_all_SD.csv', encoding= 'utf-8',sep="\t")
+df = CVAP_all_SD_df.drop(['No.','Valence_SD', 'Arousal_SD'], axis= 1)
+
+
+# 提取特徵和標籤
+#X = df[['Valence_Mean', 'Arousal_Mean']]
+#y = df['Phrase'] # 如果您的數據集中有標籤列，請替換 'label_column_name' 為您的標籤列名稱
+x = df['Phrase']
+y = df[['Valence_Mean']] # 如果您的數據集中有標籤列，請替換 'label_column_name' 為您的標籤列名稱
+
+# 將數據集分成訓練集和測試集，以 80:20 的比例分割
+x_train, x_test, y_train, y_test = train_test_split(x, y, random_state=42)
+
+
+
+# bert = AutoModel.from_pretrained('bert-base-chinese', return_dict=False)
 # tokenizer = BertTokenizerFast.from_pretrained('bert-base-chinese')
-# model = AutoModel.from_pretrained('ckiplab/bert-base-chinese')
+tokenizer = BertTokenizerFast.from_pretrained('bert-base-chinese')
+bert = AutoModel.from_pretrained('ckiplab/bert-base-chinese', return_dict=False)
+
+train_idx = x_train.dropna().index
+test_idx = x_test.dropna().index
+
+train_tokens = tokenizer.batch_encode_plus(x_train[train_idx].to_list(),
+                                           max_length = 50,
+                                           pad_to_max_length = True,
+                                           truncation = True)
+test_tokens = tokenizer.batch_encode_plus(x_test[test_idx].to_list(),
+                                           max_length = 50,
+                                           pad_to_max_length = True,
+                                           truncation = True)
+print(y_train['Valence_Mean'])
+# y_train = y_train.reset_index(drop = True)
+
+train_seq = torch.tensor(train_tokens['input_ids'])
+train_mask = torch.tensor(train_tokens['attention_mask'])
+# print([i for i in y_train['Valence_Mean']])
+train_y = torch.tensor([i for i in y_train['Valence_Mean']])
+
+test_seq = torch.tensor(test_tokens['input_ids'])
+test_mask = torch.tensor(test_tokens['attention_mask'])
+test_y = torch.tensor([i for i in y_test['Valence_Mean']])
+
+train_data = TensorDataset(train_seq, train_mask, train_y)
+train_sampler = RandomSampler(train_data)
+trainloader = DataLoader(train_data, 
+                         sampler = train_sampler,
+                         batch_size = 32)
+
+test_data = TensorDataset(test_seq, test_mask, test_y)
+test_sampler = RandomSampler(test_data)
+testloader = DataLoader(test_data, 
+                         sampler = test_sampler,
+                         batch_size = 32)
+
+for param in bert.parameters():
+    param.requires_grad = False
+
+class BertRegressor(nn.Module):
+    def __init__(self, bert):
+        super().__init__()
+        self.bert = bert
+        self.fc1 = nn.Linear(768, 128)  # add a linear layer with output size 128
+        self.relu = nn.ReLU()  # add ReLU activation function
+        self.fc2 = nn.Linear(128, 128)  # output one continuous value
+        self.fc3 = nn.Linear(128, 1)  # output one continuous value
+
+    def forward(self, sent_id, mask):
+        _, cls_hs = self.bert(sent_id, attention_mask=mask)
+        x = self.fc1(cls_hs)
+        x = self.relu(x)  # apply ReLU activation
+        x = self.fc2(x)
+        x = self.relu(x)  # apply ReLU activation
+        return self.fc3(x).squeeze()  # remove the last dimension of size 1
+
+model = BertRegressor(bert)
+model = model.cuda()
+
+optimizer = AdamW(model.parameters(), lr=1e-5)
+
+criterion = nn.MSELoss()
+
+epochs = 20
+
+for e in range(epochs):   
+    train_loss = 0.0
+    for batch in tqdm(trainloader):
+        batch = [i.cuda() for i in batch]
+        sent_id, masks, labels = batch
+
+        optimizer.zero_grad()
+        preds = model(sent_id, masks)
+        loss = criterion(preds, labels)
+        train_loss += loss.item()
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        optimizer.step()
+    print(f'Epoch:{e+1}\t\tTraining Loss: {train_loss / len(trainloader)}')
+
+pred_label = []
+true_label = []
+for batch in tqdm(testloader):
+    batch = [i.cuda() for i in batch]
+    sent_id, masks, labels = batch
+
+    preds = model(sent_id, masks)
+    #pred_label.extend(torch.argmax(preds, axis = 1).cpu())
+    pred_label.extend(preds.cpu())
+    true_label.extend(labels.cpu())
+
+from sklearn.metrics import mean_absolute_error
+
+pred_label = []
+true_label = []
+for batch in tqdm(testloader):
+    batch = [i.cuda() for i in batch]
+    sent_id, masks, labels = batch
+
+    preds = model(sent_id, masks)
+    pred_label.extend(preds.detach().cpu().numpy())
+    true_label.extend(labels.detach().cpu().numpy())
+
+mae = mean_absolute_error(true_label, pred_label)
+print(f'MAE: {mae}')
+
+def predict_sentiment(sentence, model, tokenizer):
+    encoded_sent = tokenizer.encode_plus(
+        sentence,
+        truncation=True,
+        max_length=50,
+        add_special_tokens=True,
+        # pad_to_max_length=True,
+        padding='longest',
+        return_attention_mask=True,
+        return_tensors='pt'
+    )
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    input_ids = encoded_sent['input_ids'].to(device)
+    attention_mask = encoded_sent['attention_mask'].to(device)
+
+    with torch.no_grad():
+        output = model(input_ids, attention_mask)
+
+    return output.item()
+
+sentence = "我有點不喜歡！"
+score = predict_sentiment(sentence, model, tokenizer)
+print(score)
 
-########################
-
-sents = [
-    '选择珠江花园的原因就是方便。',
-    '笔记本的键盘确实爽。',
-    '房间太小。其他的都一般。',
-    '今天才知道这书还有第6卷,真有点郁闷.',
-    '机器背面似乎被撕了张什么标签，残胶还在。',
-]
-
-#print("tokenizer : ",tokenizer)
-#print("sents : ",sents)
-
-#编码两个句子
-out = tokenizer.encode(
-    text=sents[0],
-    text_pair=sents[1],
-
-    #当句子长度大于max_length时,截断
-    truncation=True,
-
-    #一律补pad到max_length长度
-    padding='max_length',
-    add_special_tokens=True,
-    max_length=30,
-    return_tensors=None,#不指定返回數據類型，默認是list
-)
-
-#print("out : ",out)
-
-#print("tokenizer.decode : ",tokenizer.decode(out))
-
-#增强的编码函数
-out = tokenizer.encode_plus(
-    text=sents[0],
-    text_pair=sents[1],
-
-    #当句子长度大于max_length时,截断
-    truncation=True,
-
-    #一律补零到max_length长度
-    padding='max_length',
-    max_length=30,
-    add_special_tokens=True,
-
-    #可取值tf,pt,np,默认为返回list(tensorflow,pytorch,numpy)
-    return_tensors=None,
-
-    #返回token_type_ids
-    return_token_type_ids=True,
-
-    #返回attention_mask
-    return_attention_mask=True,
-
-    #返回special_tokens_mask 特殊符号标识
-    return_special_tokens_mask=True,
-
-    #返回offset_mapping 标识每个词的起止位置,这个参数只能BertTokenizerFast使用
-    #return_offsets_mapping=True,
-
-    #返回length 标识长度
-    return_length=True,
-)
-
-#input_ids 就是编码后的词
-#token_type_ids 第一个句子和特殊符号的位置是0,第二个句子的位置是1
-#special_tokens_mask 特殊符号的位置是1,其他位置是0
-#attention_mask pad的位置是0,其他位置是1
-#length 返回句子长度
-# for k, v in out.items():
-#     print(k, ':', v)
-
-tokenizer.decode(out['input_ids'])
-
-#批量编码句子
-out = tokenizer.batch_encode_plus(
-    batch_text_or_text_pairs=[sents[0], sents[1]],
-    add_special_tokens=True,
-
-    #当句子长度大于max_length时,截断
-    truncation=True,
-
-    #一律补零到max_length长度
-    padding='max_length',
-    max_length=15,
-
-    #可取值tf,pt,np,默认为返回list
-    return_tensors=None,
-
-    #返回token_type_ids
-    return_token_type_ids=True,
-
-    #返回attention_mask
-    return_attention_mask=True,
-
-    #返回special_tokens_mask 特殊符号标识
-    return_special_tokens_mask=True,
-
-    #返回offset_mapping 标识每个词的起止位置,这个参数只能BertTokenizerFast使用
-    #return_offsets_mapping=True,
-
-    #返回length 标识长度
-    return_length=True,
-)
-
-#input_ids 就是编码后的词
-#token_type_ids 第一个句子和特殊符号的位置是0,第二个句子的位置是1
-#special_tokens_mask 特殊符号的位置是1,其他位置是0
-#attention_mask pad的位置是0,其他位置是1
-#length 返回句子长度
-# for k, v in out.items():
-#     print(k, ':', v)
-
-tokenizer.decode(out['input_ids'][0]), tokenizer.decode(out['input_ids'][1])
-
-#批量编码成对的句子
-out = tokenizer.batch_encode_plus(
-    batch_text_or_text_pairs=[(sents[0], sents[1]), (sents[2], sents[3])],
-    add_special_tokens=True,
-
-    #当句子长度大于max_length时,截断
-    truncation=True,
-
-    #一律补零到max_length长度
-    padding='max_length',
-    max_length=30,
-
-    #可取值tf,pt,np,默认为返回list
-    return_tensors=None,
-
-    #返回token_type_ids
-    return_token_type_ids=True,
-
-    #返回attention_mask
-    return_attention_mask=True,
-
-    #返回special_tokens_mask 特殊符号标识
-    return_special_tokens_mask=True,
-
-    #返回offset_mapping 标识每个词的起止位置,这个参数只能BertTokenizerFast使用
-    #return_offsets_mapping=True,
-
-    #返回length 标识长度
-    return_length=True,
-)
-
-#input_ids 就是编码后的词
-#token_type_ids 第一个句子和特殊符号的位置是0,第二个句子的位置是1
-#special_tokens_mask 特殊符号的位置是1,其他位置是0
-#attention_mask pad的位置是0,其他位置是1
-#length 返回句子长度
-# for k, v in out.items():
-#     print(k, ':', v)
-
-tokenizer.decode(out['input_ids'][0])
-
-#获取字典
-zidian = tokenizer.get_vocab()
-
-print(type(zidian), len(zidian), '月光' in zidian)
-
-#添加新词
-tokenizer.add_tokens(new_tokens=['月光', '希望'])
-
-#添加新符号
-tokenizer.add_special_tokens({'eos_token': '[EOS]'})
-
-zidian = tokenizer.get_vocab()
-
-#print(type(zidian), len(zidian), zidian['月光'], zidian['[EOS]'])
-
-#编码新添加的词
-out = tokenizer.encode(
-    text='月光的新希望[EOS]',
-    text_pair=None,
-
-    #当句子长度大于max_length时,截断
-    truncation=True,
-
-    #一律补pad到max_length长度
-    padding='max_length',
-    add_special_tokens=True,
-    max_length=8,
-    return_tensors=None,
-)
-
-#print(out)
-
-#print(tokenizer.decode(out))
-
-#from datasets import load_dataset
-
-#dataset = load_dataset(path='seamew/ChnSentiCorp')
-
-#print(dataset)
-
-#保存数据集到磁盘
-#注意：运行这段代码要确保【加载数据】运行是正常的，否则直接运行【从磁盘加载数据】即可
-#dataset.save_to_disk(dataset_dict_path='./data/ChnSentiCorp')
-
-#从磁盘加载数据
-from datasets import load_from_disk
-
-dataset = load_from_disk('./data/ChnSentiCorp')
-
-print(dataset)
-
-#取出训练集
-dataset = dataset['train']
-
-#print(dataset)
-
-print(dataset[0])
-
-#sort
-
-#未排序的label是乱序的
-print(dataset['label'][:10])
-
-#排序之后label有序了
-sorted_dataset = dataset.sort('label')
-print(sorted_dataset['label'][:10])
-print(sorted_dataset['label'][-10:])
-
-#shuffle
-
-#打乱顺序
-shuffled_dataset = sorted_dataset.shuffle(seed=42)
-
-print(shuffled_dataset['label'][:10])
-
-#select
-print(dataset.select([0, 10, 20, 30, 40, 50]))
-
-#filter
-def f(data):
-    return data['text'].startswith('选择')
-
-
-start_with_ar = dataset.filter(f)
-
-print(len(start_with_ar), start_with_ar['text'])
-
-#train_test_split, 切分训练集和测试集
-dataset.train_test_split(test_size=0.1)
-
-#shard
-#把数据切分到4个桶中,均匀分配
-dataset.shard(num_shards=4, index=0)
-
-#rename_column
-dataset.rename_column('text', 'textA')
-
-#remove_columns
-dataset.remove_columns(['text'])
-
-#map
-def f(data):
-    data['text'] = 'My sentence: ' + data['text']
-    return data
-
-
-datatset_map = dataset.map(f)
-
-datatset_map['text'][:5]
-
-#set_format
-dataset.set_format(type='torch', columns=['label'])
-
-print(dataset[0])
-
-from datasets import load_dataset
-#第三章/导出为csv格式
-dataset = load_dataset(path='seamew/ChnSentiCorp', split='train')
-dataset.to_csv(path_or_buf='./data/ChnSentiCorp.csv')
-
-#加载csv格式数据
-csv_dataset = load_dataset(path='csv',
-                           data_files='./data/ChnSentiCorp.csv',
-                           split='train')
-print(csv_dataset[20])
-
-#第三章/导出为json格式
-dataset = load_dataset(path='seamew/ChnSentiCorp', split='train')
-dataset.to_json(path_or_buf='./data/ChnSentiCorp.json')
-
-#加载json格式数据
-json_dataset = load_dataset(path='json',
-                            data_files='./data/ChnSentiCorp.json',
-                            split='train')
-print(json_dataset[20])
